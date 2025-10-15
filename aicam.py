@@ -70,6 +70,26 @@ picam2.start()
 # -----------------------------
 labels = read_label_file(str(project_root / "model/mobilenet_coco/coco_labels.txt"))
 
+def pixels_to_mm(x_pixel, y_pixel, img_width, img_height, sensor_width_mm, sensor_height_mm):
+    """
+    Convert pixel coordinates to millimeters based on sensor size and image resolution.
+
+    Args:
+        x_pixel (int): X coordinate in pixels.
+        y_pixel (int): Y coordinate in pixels.
+        img_width (int): Image width in pixels.
+        img_height (int): Image height in pixels.
+        sensor_width_mm (float): Sensor width in millimeters.
+        sensor_height_mm (float): Sensor height in millimeters.
+
+    Returns:
+        (float, float): (x_mm, y_mm) coordinates in millimeters.
+    """
+    x_mm = (x_pixel / img_width) * sensor_width_mm
+    y_mm = (y_pixel / img_height) * sensor_height_mm
+    return x_mm, y_mm
+
+
 # -----------------------------
 # Inference thread + helpers
 # -----------------------------
@@ -111,6 +131,15 @@ inference_thread = threading.Thread(target=run_interpreter, daemon=True)
 last_frame_time = time.perf_counter()
 framerate = 0.0
 
+# Arducam Model 3 (IMX477) sensor specs
+SENSOR_WIDTH_MM = 6.287
+SENSOR_HEIGHT_MM = 4.712
+SENSOR_RESOLUTION = (4056, 3040)  # (width, height)
+
+# Example usage:
+# Convert pixel (x_pixel, y_pixel) to mm
+# x_mm, y_mm = pixels_to_mm(x_pixel, y_pixel, SENSOR_RESOLUTION[0], SENSOR_RESOLUTION[1], SENSOR_WIDTH_MM, SENSOR_HEIGHT_MM)
+
 # -----------------------------
 # Main loop
 # -----------------------------
@@ -128,6 +157,16 @@ try:
         # Draw overlays on the frame
         draw = ImageDraw.Draw(frame)
         for obj, bbox in detected_objs:
+            # Calculate center in pixels
+            center_x = (bbox.xmax + bbox.xmin) / 2
+            center_y = (bbox.ymax + bbox.ymin) / 2
+
+            # Convert center from pixels to millimeters
+            center_mm = pixels_to_mm(
+                center_x, center_y,
+                SENSOR_RESOLUTION[0], SENSOR_RESOLUTION[1],
+                SENSOR_WIDTH_MM, SENSOR_HEIGHT_MM
+            )
             draw.rectangle([(bbox.xmin, bbox.ymin), (bbox.xmax, bbox.ymax)], outline="yellow")
             draw.text(
                 (bbox.xmin + 10, bbox.ymin + 10),
