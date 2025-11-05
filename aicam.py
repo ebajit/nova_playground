@@ -5,12 +5,101 @@ import threading
 import time
 from pathlib import Path
 
+import socket
+import io
+import struct
+import json
 import libcamera
 from PIL import Image, ImageDraw
 from picamera2 import Picamera2
 
 # VNC-friendly shim (package in project root: displayhatmini/__init__.py)
 from displayhatmini import DisplayHATMini
+UDP_STREAM_PORT = 5000
+_udp_target = None       # (ip, port)
+_udp_sock = None
+_udp_frame_id = 0
+_udp_chunk_size = 1200   # bytes per UDP packet payload
+
+try:
+    import pi5_server
+except Exception:
+    pi5_server = None
+
+
+def _handle_stream_command(msg, sender):
+    """Handle connect/disconnect control messages from registered clients.
+
+    Expected JSON: {"cmd":"connect","ip":"<ip optional>","port":<port optional>} or {"cmd":"disconnect"}
+    If ip is not provided, the handler will try to resolve sender IP from pi5_server.user_database.
+    """
+    global _udp_target, _udp_sock
+    if not isinstance(msg, dict):
+        return
+    cmd = msg.get('cmd')
+    if cmd == 'connect':
+        ip = msg.get('ip')
+        port = int(msg.get('port', UDP_STREAM_PORT))
+        if not ip and pi5_server and sender in getattr(pi5_server, 'user_database', {}):
+            entry = pi5_server.user_database.get(sender)
+            if entry and len(entry) >= 3:
+                ip = entry[2][0]
+        if not ip:
+            try:
+                if pi5_server:
+                    pi5_server.dm_msg({"status": "error", "reason": "no_target_ip"}, sender)
+            except Exception:
+                pass
+            return
+
+        # create UDP socket if needed
+        try:
+            if _udp_sock is None:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                # reduce internal buffering to keep latency low
+                try:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 20000)
+                except Exception:
+                    pass
+                _udp_sock = s
+            _udp_target = (ip, port)
+            try:
+                if pi5_server:
+                    pi5_server.dm_msg({"status": "ok", "action": "udp_stream_set", "ip": ip, "port": port}, sender)
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                if pi5_server:
+                    pi5_server.dm_msg({"status": "error", "reason": str(e)}, sender)
+            except Exception:
+                pass
+
+    elif cmd == 'disconnect':
+        try:
+            if _udp_sock:
+                try:
+                    _udp_sock.close()
+                except Exception:
+                    pass
+            _udp_sock = None
+            _udp_target = None
+            if pi5_server:
+                try:
+                    pi5_server.dm_msg({"status": "ok", "action": "udp_stream_stopped"}, sender)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
+# register handler with pi5_server if available
+if pi5_server is not None:
+    try:
+        pi5_server.register_command_handler(_handle_stream_command)
+    except Exception:
+        pass
 
 # PyCoral / TFLite
 from pycoral.adapters import common, detect
@@ -177,6 +266,34 @@ try:
 
         # Match original orientation if needed
         frame_to_show = frame.transpose(Image.ROTATE_180)
+
+        # Encode JPEG once and send over UDP to target if requested
+        try:
+            buf = io.BytesIO()
+            frame_to_show.save(buf, format='JPEG', quality=80)
+            jpeg_bytes = buf.getvalue()
+            # send segmented over UDP
+            if _udp_target and _udp_sock:
+                try:
+                    # determine chunking
+                    chunk_sz = _udp_chunk_size
+                    total = (len(jpeg_bytes) + chunk_sz - 1) // chunk_sz
+                    _udp_frame_id = (_udp_frame_id + 1) & 0xFFFFFFFF
+                    fid = _udp_frame_id
+                    for idx in range(total):
+                        start = idx * chunk_sz
+                        chunk = jpeg_bytes[start:start+chunk_sz]
+                        hdr = struct.pack('>IHH', fid, total, idx)
+                        _udp_sock.sendto(hdr + chunk, _udp_target)
+                except Exception:
+                    try:
+                        _udp_sock.close()
+                    except Exception:
+                        pass
+                    _udp_sock = None
+                    _udp_target = None
+        except Exception:
+            pass
 
         # Show on the VNC window (shim expects a PIL image)
         displayhatmini.display(frame_to_show)
